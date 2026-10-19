@@ -74,7 +74,17 @@ if platform.system() == "Darwin":
     os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
     os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.0")
 else:
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
+    # cudaMallocAsync is an NVIDIA tuning. ROCm builds of PyTorch read the same variable and map it
+    # to hipMallocAsync, which segfaults in _local_scalar_dense (every .item()/bool(tensor), e.g.
+    # torchvision Normalize's std check) on ROCm 10.1 + PyTorch 2.14. Decide from the installed
+    # build's version string, since torch must not be imported yet.
+    try:
+        from importlib.metadata import version as _dist_version
+        _is_rocm_torch = "rocm" in _dist_version("torch")
+    except Exception:
+        _is_rocm_torch = False
+    if not _is_rocm_torch:
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 
     # Pre-parse arguments that must be handled before torch import
     _pre_parser = argparse.ArgumentParser(add_help=False)
@@ -106,6 +116,20 @@ else:
 
 # Heavy dependency imports after environment configuration
 import torch
+
+# Optional hard VRAM ceiling (fraction of device memory). Libraries that allocate outside
+# PyTorch's caching allocator (MIOpen convolution workspaces on ROCm) need headroom; without it
+# VAE decode aborted with ~0.15 GB free on a 24 GB card. A display on the same GPU needs it too.
+if os.environ.get("SEEDVR2_VRAM_FRACTION") and torch.cuda.is_available():
+    torch.cuda.set_per_process_memory_fraction(float(os.environ["SEEDVR2_VRAM_FRACTION"]))
+
+# src/common/distributed/basic.py:init_torch() would enable cudnn.benchmark but is never called,
+# so convolutions use the backend's untimed heuristic choice. On ROCm that is MIOpen "immediate
+# mode"; with benchmark on, MIOpen times the candidate kernels per shape once and caches the
+# winner (MIOPEN_USER_DB_PATH). Opt-in because the first run per new shape is slow.
+if os.environ.get("SEEDVR2_CUDNN_BENCHMARK") == "1":
+    torch.backends.cudnn.benchmark = True
+
 import cv2
 import numpy as np
 import subprocess

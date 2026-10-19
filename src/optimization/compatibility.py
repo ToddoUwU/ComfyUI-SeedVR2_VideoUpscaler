@@ -953,3 +953,83 @@ class CompatibleDiT(torch.nn.Module):
             else:
                 super().__setattr__(name, value)
                 
+
+from typing import Optional
+
+
+# 6. ROCm: scaled_dot_product_attention with head_dim > 256
+# AOTriton (PyTorch's flash / memory-efficient attention on ROCm) has no kernels for head
+# dimensions above 256, but PyTorch 2.14's dispatcher still selects it; the call then fails with
+# the misleading "hipErrorProfilerNotInitialized". The VAE's mid-block attention uses one
+# 512-wide head over every latent position, so on ROCm it is computed with exact math attention,
+# chunked over queries so the score matrix never exceeds ~1 GB.
+IS_ROCM = getattr(torch.version, 'hip', None) is not None
+ROCM_MAX_FUSED_HEAD_DIM = 256
+_CHUNK_BYTES = 1 << 30
+
+
+def chunked_math_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                           attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """softmax(q k^T / sqrt(d)) v over (batch, heads, length, dim), exact, in query chunks.
+    Matrix products run in the input dtype (bf16/fp16 matrix units, about twice the fp32 rate on
+    RDNA3); only the softmax is upcast to fp32, which is what diffusers' upcast_softmax does."""
+    b, h, lq, d = q.shape
+    lk = k.shape[-2]
+    scale = d ** -0.5
+    chunk = max(64, _CHUNK_BYTES // max(1, b * h * lk * 4))  # sized for the fp32 softmax copy
+    out = torch.empty_like(q)
+    kt = k.transpose(-1, -2) * scale  # fold the scale into k once instead of every chunk
+    for s in range(0, lq, chunk):
+        scores = torch.matmul(q[..., s:s + chunk, :], kt).float()
+        if attn_mask is not None:
+            scores = scores + attn_mask[..., s:s + chunk, :].float()
+        out[..., s:s + chunk, :] = torch.matmul(scores.softmax(dim=-1).to(q.dtype), v)
+        del scores
+    return out
+
+
+class ROCmLargeHeadAttnProcessor:
+    """diffusers AttnProcessor2_0 with the attention itself done by chunked_math_attention."""
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None,
+                 temb=None, *args, **kwargs):
+        residual = hidden_states
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+        query = attn.to_q(hidden_states)
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+        head_dim = key.shape[-1] // attn.heads
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+        hidden_states = chunked_math_attention(query, key, value, attention_mask)
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+        return hidden_states / attn.rescale_output_factor

@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.attention_processor import Attention, SpatialNorm
+from ....optimization.compatibility import (
+    IS_ROCM, ROCM_MAX_FUSED_HEAD_DIM, ROCmLargeHeadAttnProcessor)
 from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
 from diffusers.models.downsampling import Downsample2D
 from diffusers.models.lora import LoRACompatibleConv
@@ -630,6 +632,9 @@ class UNetMidBlock3D(nn.Module):
                         _from_deprecated_attn_block=True,
                     )
                 )
+                if IS_ROCM and attention_head_dim > ROCM_MAX_FUSED_HEAD_DIM:
+                    # AOTriton has no kernels for heads > 256 (see compatibility.py)
+                    attentions[-1].set_processor(ROCmLargeHeadAttnProcessor())
             else:
                 attentions.append(None)
 
